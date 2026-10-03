@@ -9,11 +9,15 @@
 输出：半透明彩色覆盖层（每区域一色）+ 区域边界 + 区域统计（数量/覆盖率/最大区域）。
 """
 import colorsys
+from collections import Counter
 
 from PIL import Image, ImageChops, ImageDraw, ImageFilter
 
 from .. import config
 from . import util
+
+# 某量化色在图像四边像素中占比超过该阈值时，判定为背景色
+_BORDER_BG_RATIO = 0.45
 
 
 _PALETTE = [
@@ -61,13 +65,19 @@ def _binary_mask(gray, params):
     return gray.point(lambda v: 255 if v >= int(value) else 0)
 
 
-def _labels_to_image(labels, w, h, region_colors):
-    """把标签矩阵渲染成彩色区域图（RGB）。region_colors: {label: (r,g,b)}。"""
+def _labels_to_image(labels, w, h, region_colors, base_rows=None):
+    """把标签矩阵渲染成彩色区域图（RGB）。region_colors: {label: (r,g,b)}。
+
+    base_rows 提供时，标签 0（背景）直接取原图像素，不给背景染色。
+    """
     data = []
     for y in range(h):
         for x in range(w):
             lbl = labels[y][x]
-            data.append(region_colors.get(lbl, (0, 0, 0)))
+            if lbl == 0 and base_rows is not None:
+                data.append(base_rows[y][x])
+            else:
+                data.append(region_colors.get(lbl, (0, 0, 0)))
     img = Image.new("RGB", (w, h))
     img.putdata(data)
     return img
@@ -107,16 +117,19 @@ def segment(image, params):
 
     if method == "color":
         labels, components = _color_clustering(work, int(params.get("colors", 6)))
+        _, _, orig_rows = util.rgb_matrix(work)
     else:
         gray = util.to_grayscale(work)
         mask = _binary_mask(gray, params)
         labels, components = _components_from_mask(mask)
+        orig_rows = None
 
     region_colors = {0: (0, 0, 0)}
     for i, label in enumerate(components.keys(), start=1):
         region_colors[label] = _PALETTE[i % len(_PALETTE)]
 
-    color_map = _labels_to_image(labels, w, h, region_colors)
+    color_map = _labels_to_image(labels, w, h, region_colors,
+                                 base_rows=orig_rows if method == "color" else None)
     # 边界：区域图边缘检测
     boundaries = color_map.filter(ImageFilter.FIND_EDGES).point(lambda v: 0 if v < 30 else v)
     color_map = Image.blend(color_map, boundaries.convert("RGB"), 0.35)
@@ -140,19 +153,42 @@ def segment(image, params):
     }
 
 
+def _border_background_colors(qrows, w, h):
+    """根据图像四边的颜色分布，识别背景量化色。
+
+    某颜色在边框像素中占比 >= _BORDER_BG_RATIO 即视为背景色
+    （纯色/均匀底的边框被该颜色铺满；满幅照片通常没有这样的主色）。
+    """
+    border = []
+    border.extend(qrows[0])
+    border.extend(qrows[h - 1])
+    for y in range(1, h - 1):
+        border.append(qrows[y][0])
+        border.append(qrows[y][w - 1])
+    counter = Counter(border)
+    total = max(len(border), 1)
+    return {c for c, n in counter.items() if n / total >= _BORDER_BG_RATIO}
+
+
 def _color_clustering(rgb, n_colors):
-    """颜色量化 + 每主色连通域，返回合并的 label 矩阵与 components。"""
+    """颜色量化 + 每主色连通域，返回合并的 label 矩阵与 components。
+
+    与边框连通的背景主色（白底/蓝底等）标记为背景，不分配区域编号、
+    不计入区域数与覆盖率；与阈值/区域生长方法的「只统计前景」语义对齐。
+    """
     quantized = rgb.quantize(colors=max(2, n_colors), method=Image.Quantize.MEDIANCUT).convert("RGB")
     w, h, qrows = util.rgb_matrix(quantized)
-    # 统计出现频率最高的颜色（背景白色除外）
-    from collections import Counter
+
     counter = Counter(qrows[y][x] for y in range(h) for x in range(w))
     target_colors = [c for c, _ in counter.most_common(n_colors + 2)]
+    bg_colors = _border_background_colors(qrows, w, h)
 
     labels = [[0] * w for _ in range(h)]
     components = {}
     next_label = 0
     for color in target_colors:
+        if color in bg_colors:
+            continue
         # 该颜色的二值掩码
         mask_rows = [[255 if qrows[y][x] == color else 0 for x in range(w)] for y in range(h)]
         _, comps = util.connected_components(mask_rows, w, h, threshold=128)
