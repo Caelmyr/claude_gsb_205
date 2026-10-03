@@ -110,6 +110,10 @@ def main():
     print("\n== 图像分割 ==")
     r = segmentation.segment(work, {"method": "color", "colors": 5})
     print(f"  区域数: {r['region_count']}  覆盖率={r['coverage']}")
+    # 回归：颜色聚类应剔除纯色背景，覆盖率不得顶满、背景不得占区域编号
+    assert r["coverage"] < 0.9, f"颜色聚类覆盖率异常顶满: {r['coverage']}"
+    bg_like = [rg for rg in r["regions"] if all(abs(c - 240) <= 15 for c in rg["mean_color"])]
+    assert not bg_like, f"背景被当成前景区域: {bg_like}"
 
     print("\n== 风格迁移 ==")
     for s in ("oil", "sketch", "cyber"):

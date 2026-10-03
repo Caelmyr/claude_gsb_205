@@ -4,11 +4,12 @@
 
 - threshold：全局（Otsu 自动或手定）二值化 -> 前景/背景两个区域。
 - region   ：自适应局部阈值 -> 二值 -> 连通域，得到多个空间区域。
-- color    ：颜色量化（中位切分）-> 每个主色掩码做连通域 -> 颜色聚类区域。
+- color    ：颜色量化（中位切分）-> 剔除边框主导的背景色 ->
+             每个主色掩码做连通域 -> 颜色聚类区域。
 
 输出：半透明彩色覆盖层（每区域一色）+ 区域边界 + 区域统计（数量/覆盖率/最大区域）。
 """
-import colorsys
+from collections import Counter
 
 from PIL import Image, ImageChops, ImageDraw, ImageFilter
 
@@ -141,13 +142,18 @@ def segment(image, params):
 
 
 def _color_clustering(rgb, n_colors):
-    """颜色量化 + 每主色连通域，返回合并的 label 矩阵与 components。"""
-    quantized = rgb.quantize(colors=max(2, n_colors), method=Image.Quantize.MEDIANCUT).convert("RGB")
+    """颜色量化 + 每主色连通域，返回合并的 label 矩阵与 components。
+
+    量化时多留一个颜色槽：边框上占多数的颜色判定为背景并剔除，
+    前景仍可取满 n_colors 个主色。背景像素保持标签 0，
+    不参与区域编号、面积与覆盖率统计。
+    """
+    quantized = rgb.quantize(colors=max(2, n_colors) + 1, method=Image.Quantize.MEDIANCUT).convert("RGB")
     w, h, qrows = util.rgb_matrix(quantized)
-    # 统计出现频率最高的颜色（背景白色除外）
-    from collections import Counter
     counter = Counter(qrows[y][x] for y in range(h) for x in range(w))
-    target_colors = [c for c, _ in counter.most_common(n_colors + 2)]
+    background = _border_background(qrows, w, h)
+    # 频率最高的前 n_colors 个主色（背景色除外）
+    target_colors = [c for c, _ in counter.most_common() if c != background][:max(2, n_colors)]
 
     labels = [[0] * w for _ in range(h)]
     components = {}
@@ -164,6 +170,25 @@ def _color_clustering(rgb, n_colors):
                 labels[py][px] = next_label
             components[next_label] = pts
     return labels, components
+
+
+def _border_background(rows, w, h):
+    """边框像素中占多数（>50%）的颜色视为背景色；无主导色时返回 None（不剔除）。
+
+    纯色底（白底/蓝底等）场景下边框必被背景主导；若图像没有干净背景
+    （如全幅渐变），边框颜色分散，不会误删前景主色。
+    """
+    border = Counter()
+    for x in range(w):
+        border[rows[0][x]] += 1
+        border[rows[h - 1][x]] += 1
+    for y in range(1, h - 1):
+        border[rows[y][0]] += 1
+        border[rows[y][w - 1]] += 1
+    color, count = border.most_common(1)[0]
+    if count > (2 * w + 2 * h - 4) * 0.5:
+        return color
+    return None
 
 
 def draw_region_outline(image, boxes, color=(255, 255, 255)):
